@@ -71,12 +71,20 @@ public struct URLSessionTransport: ClientTransport {
         /// The URLSession used for performing HTTP operations.
         public var session: URLSession
 
+        /// The buffer size to use for streaming uploads.
+        public var uploadBufferSize: Int
+
         /// Creates a new configuration with the provided session.
         /// - Parameters:
         ///     - session: The URLSession used for performing HTTP operations.
         ///     If none is provided, the system uses the shared URLSession.
-        public init(session: URLSession = .shared) {
+        ///     - uploadBufferSize: The size (in bytes) of the buffer for streaming request bodies.
+        public init(
+            session: URLSession = .shared,
+            uploadBufferSize: Int = 4096
+        ) {
             self.session = session
+            self.uploadBufferSize = uploadBufferSize
         }
     }
 
@@ -92,42 +100,176 @@ public struct URLSessionTransport: ClientTransport {
 
     public func send(
         _ request: HTTPRequest,
-        body: HTTPBody?,
+        body requestBody: HTTPBody?,
         baseURL: URL,
         operationID: String
     ) async throws -> (HTTPResponse, HTTPBody?) {
-        // TODO: https://github.com/apple/swift-openapi-generator/issues/301
-        let urlRequest = try await URLRequest(request, body: body, baseURL: baseURL)
-        let (responseBody, urlResponse) = try await invokeSession(urlRequest)
-        return try HTTPResponse.response(
-            method: request.method,
-            urlResponse: urlResponse,
-            data: responseBody
-        )
-    }
+        /// Delegate that supports streaming a request body.
+        ///
+        /// There are some quirks to this delegate that are borne out of the desire to perform
+        /// bidirectional streaming with backpressure, but without reimplementing what URLSession
+        /// already does internally.
+        ///
+        /// Specifically, URLSession provides a high-level API that returns an async sequence of
+        /// bytes, `bytes(for:delegate:)`, but does not provide an API that takes an async sequence
+        /// as a request body. For instance, `upload(for:delegate:)` and `upload(fromFile:delegate:)`
+        /// both buffer the entire response body and return `Data`.
+        ///
+        /// One option is to use `uploadTask(withStreamedRequest:delegate:)` which will ask the
+        /// delegate for a new `InputStream` via `urlSession(_:needNewBodyStreamForTask:)`.
+        ///
+        /// This is a workable approach for streaming the request body, but will require
+        /// reimplementing the bridging of response data to an async sequence using
+        /// `urlSession(_:didReceive data:)`, which will also require reimplementing backpressure
+        /// by suspeding and resuming the URLSession task.
+        ///
+        /// Even with such response body bridging in place, we would then need to make a runtime
+        /// decision on whether to use an `UploadTask` or a `DataTask` depending on the nature of
+        /// the request being made, which is overly complex.
+        ///
+        /// Instead we take a hybrid approach that only requires us to bridge the request body async
+        /// sequence. We use `bytes(for:delegate:)` in all cases, which takes care of bridging the
+        /// response body to an async sequence with backpressure.
+        ///
+        /// Providing a delegate that implements `urlSession(_:needNewBodyStreamForTask:)` does not
+        /// cause URLSession to use it for the initial request body during `bytes(for:delegate)`.
+        /// This delegate method is only used to get the initial request body stream when using
+        /// `uploadTask(withStreamedRequest:)`.
+        ///
+        /// Instead, we rely on URLSession using the request body in the URLRequest, which it takes
+        /// from either the `httpBody: Data?` or `httpBodyStream: InputStream?` properties, and if
+        /// `httpBodyStream` is non-nil, it will be used and the task will be treated as a streaming
+        /// request.
+        ///
+        /// Because `httpBodyStream` is present when the URLSession task is created, URLSession will
+        /// _not_ call `urlSession(_:needNewBodyStreamForTask:)` _initially_, but _might_ call it
+        /// later, e.g. on a redirect.
+        final class URLSessionTransportTaskDelegate: NSObject, URLSessionTaskDelegate {
 
-    private func invokeSession(_ urlRequest: URLRequest) async throws -> (Data, URLResponse) {
-        // Using `dataTask(with:completionHandler:)` instead of the async method `data(for:)` of URLSession because the latter is not available on linux platforms
-        return try await withCheckedThrowingContinuation { continuation in
-            configuration.session
-                .dataTask(with: urlRequest) { data, response, error in
-                    if let error {
-                        continuation.resume(with: .failure(error))
-                        return
-                    }
+            let requestBody: HTTPBody
+            let streamBufferSize: Int
+            var inputStream: InputStream
+            var outputStream: OutputStream
+            var requestStream: HTTPBodyOutputStreamBridge
 
-                    guard let response else {
-                        continuation.resume(
-                            with: .failure(URLSessionTransportError.noResponse(url: urlRequest.url))
-                        )
-                        return
-                    }
+            var completion: CheckedContinuation<Void, any Error>? = nil
 
-                    continuation.resume(
-                        with: .success((data ?? Data(), response))
-                    )
+            init(requestBody: HTTPBody, streamBufferSize: Int) {
+                self.requestBody = requestBody
+                self.streamBufferSize = streamBufferSize
+                // Create a pair of bound streams.
+                (self.inputStream, self.outputStream) = Self.createStreamPair(withBufferSize: streamBufferSize)
+                // Bridge the output stream to the request body, but don't open the output stream;
+                // it will be opened in the `didCreateTask` callback.
+                self.requestStream = HTTPBodyOutputStreamBridge(outputStream, requestBody, openOutputStream: false)
+            }
+
+            static func createStreamPair(withBufferSize bufferSize: Int) -> (InputStream, OutputStream) {
+                var inputStream: InputStream?
+                var outputStream: OutputStream?
+                Stream.getBoundStreams(
+                    withBufferSize: bufferSize,
+                    inputStream: &inputStream,
+                    outputStream: &outputStream
+                )
+                guard let inputStream, let outputStream else {
+                    fatalError("getBoundStreams did not return non-nil streams")
                 }
-                .resume()
+                return (inputStream, outputStream)
+            }
+
+            func urlSession(
+                _ session: URLSession,
+                task: URLSessionTask,
+                willPerformHTTPRedirection response: HTTPURLResponse,
+                newRequest request: URLRequest
+            ) async -> URLRequest? {
+                debug("Task delegate: willPerfromHTTPRediection")
+                return request
+            }
+
+            func urlSession(_ session: URLSession, didCreateTask task: URLSessionTask) {
+                debug("Task delegate: didCreateTask")
+                precondition(outputStream.streamStatus == .notOpen)
+                outputStream.open()
+            }
+
+            func urlSession(_ session: URLSession, needNewBodyStreamForTask task: URLSessionTask) async -> InputStream?
+            {
+                debug("Task delegate: needNewBodyStreamForTask")
+                // Because we're _not_ using uploadTask(withStreamedRequest:), this will
+                // _only_ be called if we need to do perform the request again, e.g. on
+                // redirection. In this instance, the output stream should be closed already.
+                precondition(outputStream.streamStatus == .closed)
+
+                // If the HTTP body cannot be iterated multiple times then bad luck; the only thing
+                // we can do is cancel the task and return nil.
+                guard requestBody.iterationBehavior == .multiple else {
+                    debug("Task delegate: Cannot rewind request body, canceling task")
+                    task.cancel()
+                    return nil
+                }
+
+                // Create a fresh pair of streams.
+                (self.inputStream, self.outputStream) = Self.createStreamPair(withBufferSize: streamBufferSize)
+
+                // Bridge the output stream to the request body and open the output stream.
+                requestStream = HTTPBodyOutputStreamBridge(outputStream, requestBody, openOutputStream: true)
+
+                // Return the new input stream (unopened, it gets opened by URLSession).
+                return inputStream
+            }
+
+            //            func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: (any Error)?) {
+            //                if let error {
+            //                    self.completion?.resume(throwing: error)
+            //                } else {
+            //                    self.completion?.resume()
+            //                }
+            //            }
+            //
+            //            func wait() async throws {
+            //                try await withCheckedThrowingContinuation { continuation in
+            //                    self.completion = continuation
+            //                }
+            //            }
+        }
+
+        var urlRequest = try URLRequest(request, baseURL: baseURL)
+        var taskDelegate: URLSessionTransportTaskDelegate? = nil
+
+        if let requestBody {
+            taskDelegate = URLSessionTransportTaskDelegate(
+                requestBody: requestBody,
+                streamBufferSize: configuration.uploadBufferSize
+            )
+            if case .known(let length) = requestBody.length {
+                urlRequest.setValue("\(length)", forHTTPHeaderField: "Content-Length")
+            }
+            urlRequest.httpBodyStream = taskDelegate!.inputStream
+        }
+
+        let (bytes, response) = try await configuration.session.bytes(for: urlRequest, delegate: taskDelegate)
+
+        let responseBody = HTTPBody(
+            bytes.map { [taskDelegate] in
+                _ = taskDelegate
+                return [$0]
+            },
+            length: HTTPBody.Length(from: response),
+            iterationBehavior: .single
+        )
+
+        return (try HTTPResponse(response), responseBody)
+    }
+}
+
+extension HTTPBody.Length {
+    init(from urlResponse: URLResponse) {
+        if urlResponse.expectedContentLength == -1 {
+            self = .unknown
+        } else {
+            self = .known(Int(urlResponse.expectedContentLength))
         }
     }
 }
@@ -146,11 +288,7 @@ internal enum URLSessionTransportError: Error {
 }
 
 extension HTTPResponse {
-    static func response(
-        method: HTTPRequest.Method,
-        urlResponse: URLResponse,
-        data: Data
-    ) throws -> (HTTPResponse, HTTPBody?) {
+    init(_ urlResponse: URLResponse) throws {
         guard let httpResponse = urlResponse as? HTTPURLResponse else {
             throw URLSessionTransportError.notHTTPResponse(urlResponse)
         }
@@ -165,25 +303,15 @@ extension HTTPResponse {
             }
             headerFields[name] = value
         }
-        let body: HTTPBody?
-        switch method {
-        case .head, .connect, .trace:
-            body = nil
-        default:
-            body = .init(data)
-        }
-        return (
-            HTTPResponse(
-                status: .init(code: httpResponse.statusCode),
-                headerFields: headerFields
-            ),
-            body
+        self.init(
+            status: .init(code: httpResponse.statusCode),
+            headerFields: headerFields
         )
     }
 }
 
 extension URLRequest {
-    init(_ request: HTTPRequest, body: HTTPBody?, baseURL: URL) async throws {
+    init(_ request: HTTPRequest, baseURL: URL) throws {
         guard
             var baseUrlComponents = URLComponents(string: baseURL.absoluteString),
             let requestUrlComponents = URLComponents(string: request.path ?? "")
@@ -210,10 +338,6 @@ extension URLRequest {
         for header in request.headerFields {
             self.setValue(header.value, forHTTPHeaderField: header.name.canonicalName)
         }
-        if let body {
-            // TODO: https://github.com/apple/swift-openapi-generator/issues/301
-            self.httpBody = try await Data(collecting: body, upTo: .max)
-        }
     }
 }
 
@@ -233,4 +357,13 @@ extension URLSessionTransportError: CustomStringConvertible {
             return "Received a nil response for \(url?.absoluteString ?? "<nil URL>")"
         }
     }
+}
+
+func debug(_ items: Any..., separator: String = " ", terminator: String = "\n") {
+    assert(
+        {
+            print(items, separator: separator, terminator: terminator)
+            return true
+        }()
+    )
 }

@@ -29,7 +29,7 @@ swiftSettings.append(
 let package = Package(
     name: "swift-openapi-urlsession",
     platforms: [
-        .macOS(.v10_15), .iOS(.v13), .tvOS(.v13), .watchOS(.v6),
+        .macOS(.v12), .iOS(.v13), .tvOS(.v13), .watchOS(.v6),
     ],
     products: [
         .library(
@@ -51,8 +51,17 @@ let package = Package(
         ),
         .testTarget(
             name: "OpenAPIURLSessionTests",
-            dependencies: ["OpenAPIURLSession"],
+            dependencies: [
+                "OpenAPIURLSession",
+                .product(name: "NIOTestUtils", package: "swift-nio"),
+            ],
             swiftSettings: swiftSettings
         ),
     ]
 )
+
+// Test-only dependencies.
+package.dependencies += [
+    // https://github.com/apple/swift-nio/pull/2563
+    .package(url: "https://github.com/simonjbeaumont/swift-nio", branch: "sb/http-test-server-without-body-aggregation"),
+]
